@@ -107,6 +107,10 @@ hr { border-color: var(--border); }
 # ── Session-state cache helpers ───────────────────────────────────────────────
 @st.cache_resource(show_spinner="Loading & processing dataset …")
 def load_all():
+    # Auto-generate demo data on Streamlit Cloud (data/ is gitignored)
+    data_file = os.path.join(os.path.dirname(__file__), "data", "online_retail_II.xlsx")
+    if not os.path.exists(data_file):
+        import generate_demo_data  # noqa: runs as side-effect, creates the file
     rfm_raw  = get_rfm()
     txn      = get_transactions()
     seg      = run_segmentation_pipeline(rfm_raw)
