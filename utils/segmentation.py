@@ -269,6 +269,7 @@ def run_segmentation_pipeline(rfm_raw: pd.DataFrame,
 
     # K-Means
     optimal_k, k_results = find_optimal_k(X)
+    optimal_k = max(optimal_k, 4)   # enforce min 4 segments for business value
     print(f"[Segmentation] Optimal K = {optimal_k}")
     km_labels = run_kmeans(X, optimal_k)
 
