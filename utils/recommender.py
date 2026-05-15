@@ -3,7 +3,7 @@ recommender.py — Hybrid recommendation engine.
 
 Architecture
 ────────────
-1. Collaborative Filtering  — Surprise SVD on user × item purchase matrix
+1. Collaborative Filtering  — TruncatedSVD on user × item purchase matrix (sklearn)
 2. Content-Based            — TF-IDF on product Description → cosine similarity
 3. Hybrid                   — weighted blend: α·CF + (1-α)·CB
 
@@ -17,6 +17,8 @@ import warnings
 import joblib
 import numpy as np
 import pandas as pd
+from scipy.sparse import csr_matrix
+from sklearn.decomposition import TruncatedSVD
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import MinMaxScaler
@@ -32,62 +34,80 @@ TFIDF_CACHE = os.path.join(CACHE_DIR, "tfidf.pkl")
 # 1.  Build user-item matrix
 # ─────────────────────────────────────────────────────────────────────────────
 def build_user_item(df: pd.DataFrame, min_purchases: int = 5) -> pd.DataFrame:
-    """
-    Aggregate purchase counts per (CustomerID, StockCode).
-    Filter out customers with fewer than min_purchases to reduce noise.
-    """
-    # Count how many times a customer bought each product
     ui = (
         df.groupby(["CustomerID", "StockCode"])["Quantity"]
         .sum()
         .reset_index()
         .rename(columns={"Quantity": "PurchaseCount"})
     )
-    # Keep only active customers
     cust_counts = ui.groupby("CustomerID")["StockCode"].count()
     active      = cust_counts[cust_counts >= min_purchases].index
     ui          = ui[ui["CustomerID"].isin(active)]
-
-    # Cap extreme purchase counts (log scale + clip)
     ui["Rating"] = np.log1p(ui["PurchaseCount"]).clip(upper=5.0)
     return ui
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2.  Collaborative Filtering — Surprise SVD
+# 2.  Collaborative Filtering — TruncatedSVD (sklearn, no compilation needed)
 # ─────────────────────────────────────────────────────────────────────────────
-def train_svd(ui: pd.DataFrame, n_factors: int = 50) -> object:
+def train_svd(ui: pd.DataFrame, n_factors: int = 50) -> dict:
+    """
+    Fit TruncatedSVD on the user-item matrix.
+    Returns a dict with the model + index mappings for inference.
+    """
     try:
-        from surprise import Dataset, Reader, SVD
-        from surprise.model_selection import train_test_split as sur_split
+        # Build index mappings
+        users = ui["CustomerID"].unique()
+        items = ui["StockCode"].unique()
+        user_idx = {u: i for i, u in enumerate(users)}
+        item_idx = {it: i for i, it in enumerate(items)}
 
-        reader  = Reader(rating_scale=(0, 5))
-        data    = Dataset.load_from_df(ui[["CustomerID", "StockCode", "Rating"]], reader)
-        trainset, _ = sur_split(data, test_size=0.1, random_state=42)
+        rows = ui["CustomerID"].map(user_idx)
+        cols = ui["StockCode"].map(item_idx)
+        vals = ui["Rating"].values
 
-        algo = SVD(n_factors=n_factors, n_epochs=20, lr_all=0.005,
-                   reg_all=0.02, random_state=42)
-        algo.fit(trainset)
+        sparse = csr_matrix((vals, (rows, cols)), shape=(len(users), len(items)))
+
+        svd = TruncatedSVD(n_components=min(n_factors, min(sparse.shape) - 1),
+                           random_state=42)
+        user_factors = svd.fit_transform(sparse)       # (n_users, k)
+        item_factors = svd.components_.T               # (n_items, k)
+
+        algo = {
+            "svd":          svd,
+            "user_factors": user_factors,
+            "item_factors": item_factors,
+            "user_idx":     user_idx,
+            "item_idx":     item_idx,
+            "users":        users,
+            "items":        items,
+        }
         joblib.dump(algo, os.path.join(CACHE_DIR, "svd.pkl"))
-        print(f"[SVD] Trained on {trainset.n_ratings:,} ratings.")
+        print(f"[SVD] Trained on {sparse.nnz:,} ratings | "
+              f"{len(users):,} users x {len(items):,} items.")
         return algo
-    except ImportError:
-        print("[SVD] scikit-surprise not installed — CF disabled.")
+    except Exception as e:
+        print(f"[SVD] Training failed: {e} — CF disabled.")
         return None
 
 
-def cf_predict(algo, customer_id: str, all_items: list, purchased: set,
-               top_n: int = 20) -> pd.DataFrame:
-    """Return top-N unseen items for a customer from the SVD model."""
-    if algo is None:
+def cf_predict(algo: dict, customer_id: str, all_items: list,
+               purchased: set, top_n: int = 20) -> pd.DataFrame:
+    """Return top-N unseen items for a customer using SVD dot product."""
+    if algo is None or customer_id not in algo["user_idx"]:
         return pd.DataFrame(columns=["StockCode", "CF_Score"])
-    predictions = [
-        (item, algo.predict(customer_id, item).est)
-        for item in all_items
-        if item not in purchased
-    ]
-    predictions.sort(key=lambda x: x[1], reverse=True)
-    top = predictions[:top_n]
+
+    uid         = algo["user_idx"][customer_id]
+    user_vec    = algo["user_factors"][uid]           # (k,)
+    scores      = algo["item_factors"].dot(user_vec)  # (n_items,)
+
+    item_arr    = algo["items"]
+    item_scores = [(item_arr[i], scores[i])
+                   for i in range(len(item_arr))
+                   if item_arr[i] not in purchased]
+    item_scores.sort(key=lambda x: x[1], reverse=True)
+
+    top = item_scores[:top_n]
     return pd.DataFrame(top, columns=["StockCode", "CF_Score"])
 
 
@@ -95,10 +115,6 @@ def cf_predict(algo, customer_id: str, all_items: list, purchased: set,
 # 3.  Content-Based — TF-IDF on product descriptions
 # ─────────────────────────────────────────────────────────────────────────────
 def build_tfidf(df: pd.DataFrame) -> tuple:
-    """
-    Returns (item_df, tfidf_matrix, vectorizer).
-    item_df has [StockCode, Description] — one row per product.
-    """
     items = (
         df[["StockCode", "Description"]]
         .dropna()
@@ -117,13 +133,12 @@ def build_tfidf(df: pd.DataFrame) -> tuple:
 
 def cb_recommend_by_product(stock_code: str, items: pd.DataFrame,
                              tfidf_matrix, top_n: int = 10) -> pd.DataFrame:
-    """Given a StockCode, find the most similar products."""
     if stock_code not in items["StockCode"].values:
         return pd.DataFrame(columns=["StockCode", "Description", "CB_Score"])
 
     idx  = items[items["StockCode"] == stock_code].index[0]
     sims = cosine_similarity(tfidf_matrix[idx], tfidf_matrix).flatten()
-    sims[idx] = 0                          # exclude self
+    sims[idx] = 0
 
     top_idx = np.argsort(sims)[::-1][:top_n]
     result  = items.iloc[top_idx].copy()
@@ -133,7 +148,6 @@ def cb_recommend_by_product(stock_code: str, items: pd.DataFrame,
 
 def cb_scores_for_customer(purchased_codes: list, items: pd.DataFrame,
                             tfidf_matrix, top_n: int = 30) -> pd.DataFrame:
-    """Aggregate CB scores across all purchased items."""
     score_dict: dict = {}
     purchased_set = set(purchased_codes)
 
@@ -158,31 +172,17 @@ def cb_scores_for_customer(purchased_codes: list, items: pd.DataFrame,
 # ─────────────────────────────────────────────────────────────────────────────
 # 4.  Hybrid blend
 # ─────────────────────────────────────────────────────────────────────────────
-def hybrid_recommend(customer_id: str,
-                     algo,
-                     items: pd.DataFrame,
-                     tfidf_matrix,
-                     ui: pd.DataFrame,
-                     alpha: float = 0.6,
-                     top_n: int = 10) -> pd.DataFrame:
-    """
-    alpha  = weight for CF score (1-alpha for CB).
-    Returns top_n recommendations with scores.
-    """
-    purchased = set(ui[ui["CustomerID"] == customer_id]["StockCode"].tolist())
-    all_items = items["StockCode"].tolist()
+def hybrid_recommend(customer_id: str, algo, items: pd.DataFrame,
+                     tfidf_matrix, ui: pd.DataFrame,
+                     alpha: float = 0.6, top_n: int = 10) -> pd.DataFrame:
+    purchased     = set(ui[ui["CustomerID"] == customer_id]["StockCode"].tolist())
+    all_items     = items["StockCode"].tolist()
 
-    # CF scores
     cf_df = cf_predict(algo, customer_id, all_items, purchased, top_n=50)
+    cb_df = cb_scores_for_customer(list(purchased), items, tfidf_matrix, top_n=50)
 
-    # CB scores
-    purchased_list = list(purchased)
-    cb_df = cb_scores_for_customer(purchased_list, items, tfidf_matrix, top_n=50)
-
-    # Merge
     merged = pd.merge(cf_df, cb_df, on="StockCode", how="outer").fillna(0)
 
-    # Normalise each score to [0, 1]
     scaler = MinMaxScaler()
     if merged["CF_Score"].max() > 0:
         merged["CF_Score"] = scaler.fit_transform(merged[["CF_Score"]])
@@ -191,8 +191,6 @@ def hybrid_recommend(customer_id: str,
 
     merged["Hybrid_Score"] = alpha * merged["CF_Score"] + (1 - alpha) * merged["CB_Score"]
     merged = merged.sort_values("Hybrid_Score", ascending=False).head(top_n)
-
-    # Add descriptions
     merged = merged.merge(items[["StockCode", "Description"]], on="StockCode", how="left")
     return merged.reset_index(drop=True)
 
@@ -203,13 +201,6 @@ def hybrid_recommend(customer_id: str,
 def evaluate_recommender(ui: pd.DataFrame, items: pd.DataFrame,
                           tfidf_matrix, algo,
                           k: int = 10, sample_users: int = 200) -> dict:
-    """
-    For each sampled user:
-      - Hold out their most recently purchased item
-      - Generate top-K recommendations
-      - Precision@K = hits / K,  Recall@K = hits / |relevant|
-    """
-    # Only evaluate users with enough history
     user_counts = ui.groupby("CustomerID")["StockCode"].count()
     eligible    = user_counts[user_counts >= 5].index.tolist()
     sampled     = pd.Series(eligible).sample(
@@ -217,32 +208,24 @@ def evaluate_recommender(ui: pd.DataFrame, items: pd.DataFrame,
     ).tolist()
 
     precisions, recalls = [], []
-
     for cid in sampled:
         user_items = ui[ui["CustomerID"] == cid].sort_values("Rating", ascending=False)
         if len(user_items) < 2:
             continue
+        held_out  = user_items.iloc[0]["StockCode"]
+        purchased = set(user_items.iloc[1:]["StockCode"].tolist())
+        all_items_list = items["StockCode"].tolist()
 
-        # Hold out top-rated item as ground truth
-        held_out = user_items.iloc[0]["StockCode"]
-        train_ui = ui[(ui["CustomerID"] != cid) |
-                      (ui["StockCode"]   != held_out)]
-
-        purchased  = set(train_ui[train_ui["CustomerID"] == cid]["StockCode"])
-        all_items  = items["StockCode"].tolist()
-
-        cf_df = cf_predict(algo, cid, all_items, purchased, top_n=k)
+        cf_df = cf_predict(algo, cid, all_items_list, purchased, top_n=k)
         recs  = set(cf_df["StockCode"].tolist())
-
-        hit        = 1 if held_out in recs else 0
-        n_relevant = 1   # leave-one-out: one held-out item
+        hit   = 1 if held_out in recs else 0
 
         precisions.append(hit / k)
-        recalls.append(hit / n_relevant)
+        recalls.append(hit / 1)
 
     return {
-        f"Precision@{k}": round(np.mean(precisions), 4) if precisions else 0.0,
-        f"Recall@{k}":    round(np.mean(recalls),    4) if recalls    else 0.0,
+        f"Precision@{k}":  round(np.mean(precisions), 4) if precisions else 0.0,
+        f"Recall@{k}":     round(np.mean(recalls),    4) if recalls    else 0.0,
         "Users_Evaluated": len(precisions),
     }
 
@@ -254,21 +237,21 @@ def run_recommender_pipeline(df: pd.DataFrame,
                               force_rebuild: bool = False,
                               evaluate: bool = True) -> dict:
     if not force_rebuild and os.path.exists(REC_CACHE):
-        print("[Recommender] Loading from cache …")
+        print("[Recommender] Loading from cache ...")
         return joblib.load(REC_CACHE)
 
-    print("[Recommender] Building user-item matrix …")
+    print("[Recommender] Building user-item matrix ...")
     ui = build_user_item(df, min_purchases=3)
 
-    print("[Recommender] Training SVD …")
+    print("[Recommender] Training SVD ...")
     algo = train_svd(ui)
 
-    print("[Recommender] Building TF-IDF index …")
+    print("[Recommender] Building TF-IDF index ...")
     items, tfidf_matrix, vectorizer = build_tfidf(df)
 
     eval_metrics = {}
     if evaluate and algo is not None:
-        print("[Recommender] Evaluating (Leave-One-Out) …")
+        print("[Recommender] Evaluating (Leave-One-Out) ...")
         eval_metrics = evaluate_recommender(ui, items, tfidf_matrix, algo)
         print(f"[Recommender] Metrics: {eval_metrics}")
 
