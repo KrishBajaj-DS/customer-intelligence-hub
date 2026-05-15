@@ -36,7 +36,7 @@ def _download_from_gdrive() -> None:
         import gdown
         print("[DataLoader] Downloading dataset from Google Drive ...")
         url = f"https://drive.google.com/uc?id={GDRIVE_FILE_ID}"
-        gdown.download(url, RAW_FILE_CSV, quiet=False, fuzzy=True)
+        gdown.download(url, RAW_FILE_CSV, quiet=False)
         print("[DataLoader] Download complete.")
     except Exception as e:
         raise RuntimeError(
